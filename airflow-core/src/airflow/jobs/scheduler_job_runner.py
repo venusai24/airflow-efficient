@@ -1,3 +1,56 @@
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+# ...existing code...
+
+class DAGChangeWatcher(FileSystemEventHandler):
+    """
+    Watches a DAG directory for file changes and maintains a set of changed DAG IDs.
+    """
+    def __init__(self, dag_dir: str):
+        super().__init__()
+        self.dag_dir = dag_dir
+        self.changed_dags = set()
+        self.observer = Observer()
+        self.observer.schedule(self, dag_dir, recursive=True)
+        self.observer.start()
+
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+        dag_id = self._extract_dag_id(event.src_path)
+        if dag_id:
+            self.changed_dags.add(dag_id)
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        dag_id = self._extract_dag_id(event.src_path)
+        if dag_id:
+            self.changed_dags.add(dag_id)
+
+    def on_deleted(self, event):
+        if event.is_directory:
+            return
+        dag_id = self._extract_dag_id(event.src_path)
+        if dag_id:
+            self.changed_dags.add(dag_id)
+
+    def get_and_clear_changed_dags(self):
+        dags = list(self.changed_dags)
+        self.changed_dags.clear()
+        return dags
+
+    def _extract_dag_id(self, file_path):
+        # Simple heuristic: filename without extension is dag_id
+        import os
+        base = os.path.basename(file_path)
+        if base.endswith('.py'):
+            return base[:-3]
+        return None
+
+    def stop(self):
+        self.observer.stop()
+        self.observer.join()
 #
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -25,6 +78,7 @@ import signal
 import sys
 import time
 from collections import Counter, defaultdict, deque
+from airflow.jobs.coordinator import Coordinator, RaftCoordinator, ZooKeeperCoordinator
 from collections.abc import Callable, Collection, Iterable, Iterator
 from contextlib import ExitStack
 from datetime import date, timedelta
@@ -225,34 +279,36 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
         num_runs: int = conf.getint("scheduler", "num_runs"),
         scheduler_idle_sleep_time: float = conf.getfloat("scheduler", "scheduler_idle_sleep_time"),
         log: logging.Logger | None = None,
+        coordinator: Coordinator = None,
+        shard_id: str = None,
     ):
         super().__init__(job)
         self.num_runs = num_runs
         self._scheduler_idle_sleep_time = scheduler_idle_sleep_time
-        # How many seconds do we wait for tasks to heartbeat before timeout.
-        self._task_instance_heartbeat_timeout_secs = conf.getint(
-            "scheduler", "task_instance_heartbeat_timeout"
-        )
+        self._task_instance_heartbeat_timeout_secs = conf.getint("scheduler", "task_instance_heartbeat_timeout")
         self._dag_stale_not_seen_duration = conf.getint("scheduler", "dag_stale_not_seen_duration")
         self._task_queued_timeout = conf.getfloat("scheduler", "task_queued_timeout")
         self._enable_tracemalloc = conf.getboolean("scheduler", "enable_tracemalloc")
-
-        # this param is intentionally undocumented
-        self._num_stuck_queued_retries = conf.getint(
-            section="scheduler",
-            key="num_stuck_in_queued_retries",
-            fallback=2,
-        )
+        self._num_stuck_queued_retries = conf.getint(section="scheduler", key="num_stuck_in_queued_retries", fallback=2)
 
         if self._enable_tracemalloc:
             import tracemalloc
-
             tracemalloc.start()
-
         if log:
             self._log = log
-
         self.scheduler_dag_bag = SchedulerDagBag()
+
+        # Event-driven DAG change watcher
+        dag_dir = conf.get("core", "dags_folder")
+        self.dag_change_watcher = DAGChangeWatcher(dag_dir)
+
+        # Coordinator for distributed sharding/locking
+        self.coordinator = coordinator or RaftCoordinator()  # Default to Raft, can be swapped
+        self.shard_id = shard_id or f"scheduler-{os.getpid()}"
+
+        # Acquire shard for this scheduler instance
+        if not self.coordinator.acquire_shard(self.shard_id):
+            raise RuntimeError(f"Failed to acquire shard {self.shard_id}")
 
     @provide_session
     def heartbeat_callback(self, session: Session = NEW_SESSION) -> None:
@@ -1269,33 +1325,27 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 DebugTrace.start_span(span_name="scheduler_job_loop", component="SchedulerJobRunner") as span,
                 Stats.timer("scheduler.scheduler_loop_duration") as timer,
             ):
-                span.set_attributes(
-                    {
-                        "category": "scheduler",
-                        "loop_count": loop_count,
-                    }
-                )
+                span.set_attributes({"category": "scheduler", "loop_count": loop_count})
+
+                # Incremental, event-driven DAG parsing stub
+                changed_dags = self._get_changed_dags_event_driven()
+                for dag_id in changed_dags:
+                    if self.coordinator.acquire_dag_lock(dag_id):
+                        self._parse_and_schedule_dag(dag_id)
+                        self.coordinator.release_dag_lock(dag_id)
 
                 with create_session() as session:
                     self._end_spans_of_externally_ended_ops(session)
-
-                    # This will schedule for as many executors as possible.
                     num_queued_tis = self._do_scheduling(session)
-                    # Don't keep any objects alive -- we've possibly just looked at 500+ ORM objects!
                     session.expunge_all()
 
-                # Heartbeat all executors, even if they're not receiving new tasks this loop. It will be
-                # either a no-op, or they will check-in on currently running tasks and send out new
-                # events to be processed below.
                 for executor in self.job.executors:
                     executor.heartbeat()
 
                 with create_session() as session:
                     num_finished_events = 0
                     for executor in self.job.executors:
-                        num_finished_events += self._process_executor_events(
-                            executor=executor, session=session
-                        )
+                        num_finished_events += self._process_executor_events(executor=executor, session=session)
 
                 for executor in self.job.executors:
                     try:
@@ -1304,28 +1354,15 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                     except Exception:
                         self.log.exception("Something went wrong when trying to save task event logs.")
 
-                # Heartbeat the scheduler periodically
-                perform_heartbeat(
-                    job=self.job, heartbeat_callback=self.heartbeat_callback, only_if_necessary=True
-                )
-
-                # Run any pending timed events
+                perform_heartbeat(job=self.job, heartbeat_callback=self.heartbeat_callback, only_if_necessary=True)
                 next_event = timers.run(blocking=False)
                 self.log.debug("Next timed event is in %f", next_event)
 
             self.log.debug("Ran scheduling loop in %.2f seconds", timer.duration)
             if span.is_recording():
-                span.add_event(
-                    name="Ran scheduling loop",
-                    attributes={
-                        "duration in seconds": timer.duration,
-                    },
-                )
+                span.add_event(name="Ran scheduling loop", attributes={"duration in seconds": timer.duration})
 
             if not is_unit_test and not num_queued_tis and not num_finished_events:
-                # If the scheduler is doing things, don't sleep. This means when there is work to do, the
-                # scheduler will run "as quick as possible", but when it's stopped, it can sleep, dropping CPU
-                # usage when "idle"
                 time.sleep(min(self._scheduler_idle_sleep_time, next_event or 0))
 
             if loop_count >= self.num_runs > 0:
@@ -1337,6 +1374,19 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
                 if span.is_recording():
                     span.add_event("Exiting scheduler loop as requested number of runs has been reached")
                 break
+
+    def _get_changed_dags_event_driven(self):
+        """
+        Return list of DAG IDs that have changed, using the DAGChangeWatcher.
+        """
+        return self.dag_change_watcher.get_and_clear_changed_dags()
+
+    def _parse_and_schedule_dag(self, dag_id):
+        """
+        Stub: Incrementally parse and schedule a single DAG.
+        """
+        # TODO: Implement incremental DAG parsing and scheduling
+        pass
 
     def _do_scheduling(self, session: Session) -> int:
         """
